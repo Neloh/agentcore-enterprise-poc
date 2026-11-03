@@ -1,0 +1,206 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  AgentCore enterprise PoC - monitoring: CloudWatch alarms (including the composite
+  rollback alarm watched during the pipeline bake), and an operations dashboard.
+  Deployed by the pipeline after the runtimes exist, because alarm dimensions need
+  the runtime ARNs.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: agentcore-poc
+  AgentRuntimeArn:
+    Type: String
+  McpRuntimeArn:
+    Type: String
+  AgentRuntimeName:
+    Type: String
+    Default: poc_agent
+  McpRuntimeName:
+    Type: String
+    Default: poc_mcp_tools
+  EndpointName:
+    Type: String
+    Default: live
+  AlertTopicArn:
+    Type: String
+  MetricsNamespace:
+    Type: String
+    Default: AgentCorePoc
+  LatencyP90ThresholdMs:
+    Type: Number
+    Default: 30000
+
+Resources:
+  # AWS/Bedrock-AgentCore runtime metrics use the dimension set
+  #   Resource=<runtime ARN>, Operation=InvokeAgentRuntime, Name=<runtime name>::<endpoint>
+  AgentSystemErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${AgentRuntimeName}-${EndpointName}-SystemErrors"
+      AlarmDescription: AgentCore 5xx on the agent endpoint (rollback trigger).
+      Namespace: AWS/Bedrock-AgentCore
+      MetricName: SystemErrors
+      Dimensions:
+        - { Name: Resource, Value: !Ref AgentRuntimeArn }
+        - { Name: Operation, Value: InvokeAgentRuntime }
+        - { Name: Name, Value: !Sub "${AgentRuntimeName}::${EndpointName}" }
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopicArn]
+
+  AgentLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${AgentRuntimeName}-${EndpointName}-LatencyP90"
+      AlarmDescription: Agent end-to-end latency p90 regression (rollback trigger).
+      Namespace: AWS/Bedrock-AgentCore
+      MetricName: Latency
+      Dimensions:
+        - { Name: Resource, Value: !Ref AgentRuntimeArn }
+        - { Name: Operation, Value: InvokeAgentRuntime }
+        - { Name: Name, Value: !Sub "${AgentRuntimeName}::${EndpointName}" }
+      ExtendedStatistic: p90
+      Period: 300
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: !Ref LatencyP90ThresholdMs
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopicArn]
+
+  AgentThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${AgentRuntimeName}-${EndpointName}-Throttles"
+      AlarmDescription: Agent invocations throttled (quota pressure; not a rollback trigger).
+      Namespace: AWS/Bedrock-AgentCore
+      MetricName: Throttles
+      Dimensions:
+        - { Name: Resource, Value: !Ref AgentRuntimeArn }
+        - { Name: Operation, Value: InvokeAgentRuntime }
+        - { Name: Name, Value: !Sub "${AgentRuntimeName}::${EndpointName}" }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopicArn]
+
+  McpSystemErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${McpRuntimeName}-${EndpointName}-SystemErrors"
+      AlarmDescription: AgentCore 5xx on the MCP tool server endpoint (rollback trigger).
+      Namespace: AWS/Bedrock-AgentCore
+      MetricName: SystemErrors
+      Dimensions:
+        - { Name: Resource, Value: !Ref McpRuntimeArn }
+        - { Name: Operation, Value: InvokeAgentRuntime }
+        - { Name: Name, Value: !Sub "${McpRuntimeName}::${EndpointName}" }
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopicArn]
+
+  # Custom metrics emitted by the agent (EMF) - services/agent/app/policy.py
+  ModelCallErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${AgentRuntimeName}-ModelCallErrors"
+      AlarmDescription: Bedrock model invocation failures inside the agent (rollback trigger).
+      Namespace: !Ref MetricsNamespace
+      MetricName: ModelCallErrors
+      Dimensions:
+        - { Name: Service, Value: !Ref AgentRuntimeName }
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopicArn]
+
+  GuardrailSpikeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${AgentRuntimeName}-GuardrailInterventions"
+      AlarmDescription: Unusual volume of guardrail interventions (possible abuse or prompt regression). Notify only.
+      Namespace: !Ref MetricsNamespace
+      MetricName: GuardrailInterventions
+      Dimensions:
+        - { Name: Service, Value: !Ref AgentRuntimeName }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 20
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopicArn]
+
+  RollbackCompositeAlarm:
+    Type: AWS::CloudWatch::CompositeAlarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-rollback"
+      AlarmDescription: Any rollback trigger firing. Watched by the pipeline bake step.
+      AlarmRule: !Sub >-
+        ALARM("${AgentSystemErrorsAlarm}") OR ALARM("${AgentLatencyAlarm}") OR
+        ALARM("${McpSystemErrorsAlarm}") OR ALARM("${ModelCallErrorsAlarm}")
+      AlarmActions: [!Ref AlertTopicArn]
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${ProjectName}-operations"
+      DashboardBody: !Sub
+        - |
+          {
+            "widgets": [
+              {"type":"text","x":0,"y":0,"width":24,"height":2,"properties":{"markdown":"## ${ProjectName} - AgentCore operations\nAgent: **${AgentRuntimeName}::${EndpointName}** | MCP tools: **${McpRuntimeName}::${EndpointName}** | Traces: CloudWatch > GenAI Observability > Bedrock AgentCore"}},
+              {"type":"metric","x":0,"y":2,"width":8,"height":6,"properties":{"title":"Agent invocations / errors","region":"${AWS::Region}","stat":"Sum","period":60,"metrics":[
+                ["AWS/Bedrock-AgentCore","Invocations","Resource","${AgentRuntimeArn}","Operation","InvokeAgentRuntime","Name","${AgentRuntimeName}::${EndpointName}"],
+                [".","SystemErrors",".",".",".",".",".","."],
+                [".","UserErrors",".",".",".",".",".","."],
+                [".","Throttles",".",".",".",".",".","."]]}},
+              {"type":"metric","x":8,"y":2,"width":8,"height":6,"properties":{"title":"Agent latency (ms)","region":"${AWS::Region}","period":300,"metrics":[
+                ["AWS/Bedrock-AgentCore","Latency","Resource","${AgentRuntimeArn}","Operation","InvokeAgentRuntime","Name","${AgentRuntimeName}::${EndpointName}",{"stat":"p50"}],
+                ["...",{"stat":"p90"}],
+                ["...",{"stat":"p99"}]],
+                "annotations":{"horizontal":[{"label":"rollback threshold p90","value":${LatencyP90ThresholdMs}}]}}},
+              {"type":"metric","x":16,"y":2,"width":8,"height":6,"properties":{"title":"MCP tool server","region":"${AWS::Region}","stat":"Sum","period":60,"metrics":[
+                ["AWS/Bedrock-AgentCore","Invocations","Resource","${McpRuntimeArn}","Operation","InvokeAgentRuntime","Name","${McpRuntimeName}::${EndpointName}"],
+                [".","SystemErrors",".",".",".",".",".","."],
+                [".","UserErrors",".",".",".",".",".","."]]}},
+              {"type":"metric","x":0,"y":8,"width":12,"height":6,"properties":{"title":"Guardrails & tool policy","region":"${AWS::Region}","stat":"Sum","period":300,"metrics":[
+                ["${MetricsNamespace}","GuardrailInterventions","Service","${AgentRuntimeName}"],
+                [".","ModelCallErrors",".","."],
+                [{"expression":"SEARCH('{${MetricsNamespace},Service,Tool} MetricName=\"ToolCallsDenied\"', 'Sum', 300)","label":"denied","id":"denied"}],
+                [{"expression":"SEARCH('{${MetricsNamespace},Service,Tool} MetricName=\"ToolCallsAllowed\"', 'Sum', 300)","label":"allowed","id":"allowed"}]]}},
+              {"type":"alarm","x":12,"y":8,"width":12,"height":6,"properties":{"title":"Alarms","alarms":[
+                "${RollbackArn}","${AgentErrArn}","${AgentLatArn}","${McpErrArn}","${ModelErrArn}","${GuardArn}","${ThrottleArn}"]}}
+            ]
+          }
+        - RollbackArn: !GetAtt RollbackCompositeAlarm.Arn
+          AgentErrArn: !GetAtt AgentSystemErrorsAlarm.Arn
+          AgentLatArn: !GetAtt AgentLatencyAlarm.Arn
+          McpErrArn: !GetAtt McpSystemErrorsAlarm.Arn
+          ModelErrArn: !GetAtt ModelCallErrorsAlarm.Arn
+          GuardArn: !GetAtt GuardrailSpikeAlarm.Arn
+          ThrottleArn: !GetAtt AgentThrottlesAlarm.Arn
+
+Outputs:
+  RollbackAlarmName:
+    Value: !Ref RollbackCompositeAlarm
+  DashboardUrl:
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-operations"

@@ -1,0 +1,58 @@
+version: 0.2
+# Stage 2: deploy new runtime versions, point the 'staging' endpoints at them,
+# (re)deploy alarms + dashboard, then run the eval gate against agent::staging.
+env:
+  shell: bash
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+    commands:
+      - pip install -q -r requirements-dev.txt
+  build:
+    commands:
+      - export IMAGES="$CODEBUILD_SRC_DIR_Images/images.json"
+      - export TAG=$(python -c "import json;print(json.load(open('$IMAGES'))['tag'])")
+      - export MCP_IMAGE=$(python -c "import json;print(json.load(open('$IMAGES'))['mcp_image'])")
+      - export AGENT_IMAGE=$(python -c "import json;print(json.load(open('$IMAGES'))['agent_image'])")
+
+      # 1) MCP tool server -> new version -> staging endpoint
+      - >-
+        python deploy/agentcore.py deploy --name "$MCP_RUNTIME" --image "$MCP_IMAGE" --role "$EXEC_ROLE_ARN"
+        --protocol MCP --env APP_VERSION="$TAG" --description "mcp tools $TAG" --out mcp.json
+      - export MCP_VERSION=$(python -c "import json;print(json.load(open('mcp.json'))['version'])")
+      - python deploy/agentcore.py promote --name "$MCP_RUNTIME" --endpoint staging --version "$MCP_VERSION"
+      - export MCP_STAGING_URL=$(python deploy/agentcore.py url --name "$MCP_RUNTIME" --endpoint staging)
+
+      # 2) Agent -> new version wired to MCP::staging -> staging endpoint
+      - >-
+        python deploy/agentcore.py deploy --name "$AGENT_RUNTIME" --image "$AGENT_IMAGE" --role "$EXEC_ROLE_ARN"
+        --protocol A2A --description "agent $TAG (staging config)" --out agent.json
+        --env APP_VERSION="$TAG" --env AGENT_NAME="$AGENT_RUNTIME" --env MODEL_PROVIDER=bedrock
+        --env MODEL_ID="$MODEL_ID" --env GUARDRAIL_ID="$GUARDRAIL_ID" --env GUARDRAIL_VERSION="$GUARDRAIL_VERSION"
+        --env MCP_URL="$MCP_STAGING_URL" --env MCP_AUTH=sigv4
+      - export AGENT_VERSION=$(python -c "import json;print(json.load(open('agent.json'))['version'])")
+      - export AGENT_ARN=$(python -c "import json;print(json.load(open('agent.json'))['runtimeArn'])")
+      - export MCP_ARN=$(python -c "import json;print(json.load(open('mcp.json'))['runtimeArn'])")
+      - python deploy/agentcore.py promote --name "$AGENT_RUNTIME" --endpoint staging --version "$AGENT_VERSION"
+
+      # 3) Alarms + dashboard (needs runtime ARNs; idempotent)
+      - >-
+        aws cloudformation deploy --stack-name "$PROJECT_NAME-monitoring" --template-file infra/monitoring.yaml
+        --no-fail-on-empty-changeset --parameter-overrides ProjectName="$PROJECT_NAME"
+        AgentRuntimeArn="$AGENT_ARN" McpRuntimeArn="$MCP_ARN" AgentRuntimeName="$AGENT_RUNTIME"
+        McpRuntimeName="$MCP_RUNTIME" AlertTopicArn="$ALERT_TOPIC_ARN"
+
+      # 4) Evaluation gate against the real model + real guardrail on agent::staging
+      - python evals/run_eval.py --runtime-arn "$AGENT_ARN" --endpoint staging --threshold "$EVAL_THRESHOLD" --report eval-report.json
+  post_build:
+    commands:
+      - >-
+        python -c "import json,os; e=os.environ; json.dump({k: e.get(k) for k in
+        ['TAG','MCP_IMAGE','AGENT_IMAGE','MCP_VERSION','AGENT_VERSION','AGENT_ARN','MCP_ARN']},
+        open('release.json','w'), indent=2)"
+      - cat release.json
+artifacts:
+  files:
+    - release.json
+    - eval-report.json

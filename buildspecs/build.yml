@@ -1,0 +1,44 @@
+version: 0.2
+# Stage 1: unit tests + IaC lint + arm64 image build + offline container integration test + push.
+env:
+  shell: bash
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+    commands:
+      - pip install -q -r requirements-dev.txt
+  pre_build:
+    commands:
+      - python -m pytest -q tests
+      - cfn-lint --regions "$AWS_REGION" -- infra/*.yaml
+      - export TAG="${CODEBUILD_RESOLVED_SOURCE_VERSION:0:12}-${CODEBUILD_BUILD_NUMBER}"
+      - aws ecr get-login-password | docker login --username AWS --password-stdin "${AGENT_REPO%%/*}"
+  build:
+    commands:
+      - docker build --build-arg APP_VERSION="$TAG" -t "$MCP_REPO:$TAG" services/mcp_tools
+      - docker build --build-arg APP_VERSION="$TAG" -t "$AGENT_REPO:$TAG" services/agent
+      # Integration test of the exact images, offline (stub model), before anything is pushed.
+      - docker network create poc-it
+      - docker run -d --name mcp-tools --network poc-it -e MCP_ALLOWED_HOSTS=mcp-tools:8000 "$MCP_REPO:$TAG"
+      - >-
+        docker run -d --name agent --network poc-it -p 127.0.0.1:9000:9000
+        -e MODEL_PROVIDER=stub -e MCP_URL=http://mcp-tools:8000/mcp
+        -e OTEL_TRACES_EXPORTER=none -e OTEL_METRICS_EXPORTER=none -e OTEL_LOGS_EXPORTER=none
+        "$AGENT_REPO:$TAG"
+      - for i in $(seq 1 30); do curl -sf http://127.0.0.1:9000/ping && break; sleep 2; done
+      - python evals/run_eval.py --url http://127.0.0.1:9000/ --threshold 1.0 --report it-report.json
+      - docker push "$MCP_REPO:$TAG"
+      - docker push "$AGENT_REPO:$TAG"
+  post_build:
+    commands:
+      - docker rm -f agent mcp-tools >/dev/null 2>&1 || true
+      - >-
+        python -c "import json,os; json.dump({'tag': os.environ['TAG'],
+        'mcp_image': os.environ['MCP_REPO']+':'+os.environ['TAG'],
+        'agent_image': os.environ['AGENT_REPO']+':'+os.environ['TAG']}, open('images.json','w'), indent=2)"
+      - cat images.json
+artifacts:
+  files:
+    - images.json
+    - it-report.json

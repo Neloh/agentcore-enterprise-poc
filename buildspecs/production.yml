@@ -1,0 +1,53 @@
+version: 0.2
+# Stage 4 (after manual approval): promote to 'live', smoke test, bake on the
+# composite rollback alarm, and automatically move endpoints back on failure.
+#
+# Order: MCP first (agent depends on it), then agent. Rollback order is reversed.
+# The agent image is NOT rebuilt: the same image gets a new runtime version whose
+# only difference is MCP_URL -> MCP::live (build once, configure per environment).
+env:
+  shell: bash
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+    commands:
+      - pip install -q -r requirements-dev.txt
+  build:
+    commands:
+      - export REL="$CODEBUILD_SRC_DIR_Release/release.json"
+      - for k in TAG AGENT_IMAGE MCP_VERSION; do export $k=$(python -c "import json;print(json.load(open('$REL'))['$k'])"); done
+
+      - python deploy/agentcore.py promote --name "$MCP_RUNTIME" --endpoint live --version "$MCP_VERSION" --out mcp-live.json
+      - export MCP_PREV=$(python -c "import json;print(json.load(open('mcp-live.json'))['previous'] or '')")
+      - export MCP_LIVE_URL=$(python deploy/agentcore.py url --name "$MCP_RUNTIME" --endpoint live)
+
+      - >-
+        python deploy/agentcore.py deploy --name "$AGENT_RUNTIME" --image "$AGENT_IMAGE" --role "$EXEC_ROLE_ARN"
+        --protocol A2A --description "agent $TAG (live config)" --out agent-live-version.json
+        --env APP_VERSION="$TAG" --env AGENT_NAME="$AGENT_RUNTIME" --env MODEL_PROVIDER=bedrock
+        --env MODEL_ID="$MODEL_ID" --env GUARDRAIL_ID="$GUARDRAIL_ID" --env GUARDRAIL_VERSION="$GUARDRAIL_VERSION"
+        --env MCP_URL="$MCP_LIVE_URL" --env MCP_AUTH=sigv4
+      - export AGENT_LIVE_VERSION=$(python -c "import json;print(json.load(open('agent-live-version.json'))['version'])")
+      - export AGENT_ARN=$(python -c "import json;print(json.load(open('agent-live-version.json'))['runtimeArn'])")
+      - python deploy/agentcore.py promote --name "$AGENT_RUNTIME" --endpoint live --version "$AGENT_LIVE_VERSION" --out agent-live.json
+      - export AGENT_PREV=$(python -c "import json;print(json.load(open('agent-live.json'))['previous'] or '')")
+
+      # Smoke test on live (also generates traffic for the bake window).
+      - |
+        if ! python evals/run_eval.py --runtime-arn "$AGENT_ARN" --endpoint live --threshold "$EVAL_THRESHOLD" --report live-smoke.json; then
+          echo "live smoke test failed -> rolling back"
+          [ -n "$AGENT_PREV" ] && python deploy/agentcore.py rollback --name "$AGENT_RUNTIME" --endpoint live --version "$AGENT_PREV"
+          [ -n "$MCP_PREV" ] && python deploy/agentcore.py rollback --name "$MCP_RUNTIME" --endpoint live --version "$MCP_PREV"
+          exit 1
+        fi
+
+      # Bake: watch the composite alarm; bake() rolls back both endpoints itself if it fires.
+      - >-
+        python deploy/agentcore.py bake --alarms "$PROJECT_NAME-rollback" --minutes "$BAKE_MINUTES" --poll 30
+        --target "$AGENT_RUNTIME:live:$AGENT_PREV" --target "$MCP_RUNTIME:live:$MCP_PREV"
+artifacts:
+  files:
+    - mcp-live.json
+    - agent-live.json
+    - live-smoke.json

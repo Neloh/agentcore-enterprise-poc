@@ -1,0 +1,5 @@
+-r services/agent/requirements.txt
+-r services/mcp_tools/requirements.txt
+pytest==9.2.0
+cfn-lint==1.59.0
+httpx==0.28.1

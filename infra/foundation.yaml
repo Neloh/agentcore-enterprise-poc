@@ -1,0 +1,210 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  AgentCore enterprise PoC - foundation: ECR repositories, Amazon Bedrock Guardrail,
+  AgentCore Runtime execution role, alert topic. Runtimes themselves are created by
+  the pipeline (deploy/agentcore.py) so that versions/endpoints can be promoted and
+  rolled back independently of CloudFormation.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: agentcore-poc
+    AllowedPattern: "^[a-z][a-z0-9-]{2,30}$"
+  AgentRuntimeName:
+    Type: String
+    Default: poc_agent
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9_]{0,47}$"
+  McpRuntimeName:
+    Type: String
+    Default: poc_mcp_tools
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9_]{0,47}$"
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Optional email subscribed to alarm and approval notifications.
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Resources:
+  # ------------------------------------------------------------------ container registry
+  AgentRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${ProjectName}/agent"
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration: { ScanOnPush: true }
+      EncryptionConfiguration: { EncryptionType: AES256 }
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"keep last 30","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":30},"action":{"type":"expire"}}]}'
+
+  McpRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${ProjectName}/mcp-tools"
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration: { ScanOnPush: true }
+      EncryptionConfiguration: { EncryptionType: AES256 }
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"keep last 30","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":30},"action":{"type":"expire"}}]}'
+
+  # ------------------------------------------------------------------ guardrails
+  Guardrail:
+    Type: AWS::Bedrock::Guardrail
+    Properties:
+      Name: !Sub "${ProjectName}-guardrail"
+      Description: Input/output safety for the customer-support agent.
+      BlockedInputMessaging: "Sorry, I can't help with that request."
+      BlockedOutputsMessaging: "Sorry, I can't help with that request."
+      ContentPolicyConfig:
+        FiltersConfig:
+          - { Type: SEXUAL, InputStrength: HIGH, OutputStrength: HIGH }
+          - { Type: VIOLENCE, InputStrength: HIGH, OutputStrength: HIGH }
+          - { Type: HATE, InputStrength: HIGH, OutputStrength: HIGH }
+          - { Type: INSULTS, InputStrength: MEDIUM, OutputStrength: MEDIUM }
+          - { Type: MISCONDUCT, InputStrength: HIGH, OutputStrength: HIGH }
+          # Prompt-attack filtering applies to input only; output strength must be NONE.
+          - { Type: PROMPT_ATTACK, InputStrength: HIGH, OutputStrength: NONE }
+      TopicPolicyConfig:
+        TopicsConfig:
+          - Name: InvestmentAdvice
+            Type: DENY
+            Definition: Recommendations about investing money, stocks, crypto or financial products.
+            Examples:
+              - Which stocks should I buy?
+              - Should I invest my refund in crypto?
+      SensitiveInformationPolicyConfig:
+        PiiEntitiesConfig:
+          - { Type: EMAIL, Action: ANONYMIZE }
+          - { Type: PHONE, Action: ANONYMIZE }
+          - { Type: CREDIT_DEBIT_CARD_NUMBER, Action: BLOCK }
+          - { Type: AWS_ACCESS_KEY, Action: BLOCK }
+          - { Type: AWS_SECRET_KEY, Action: BLOCK }
+      Tags:
+        - { Key: project, Value: !Ref ProjectName }
+
+  GuardrailVersion:
+    Type: AWS::Bedrock::GuardrailVersion
+    Properties:
+      GuardrailIdentifier: !GetAtt Guardrail.GuardrailId
+      Description: Pinned version consumed by the agent runtime.
+
+  # ------------------------------------------------------------------ runtime execution role
+  RuntimeExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-runtime-exec-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: bedrock-agentcore.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+              ArnLike: { aws:SourceArn: !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:*" }
+      Policies:
+        - PolicyName: agentcore-runtime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ECRImageAccess
+                Effect: Allow
+                Action: [ecr:BatchGetImage, ecr:GetDownloadUrlForLayer]
+                Resource: [!GetAtt AgentRepository.Arn, !GetAtt McpRepository.Arn]
+              - Sid: ECRTokenAccess
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action: [logs:DescribeLogStreams, logs:CreateLogGroup]
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*"
+              - Sid: UnifiedSpanDestination
+                Effect: Allow
+                Action: logs:PutResourcePolicy
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/${AgentRuntimeName}-*"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/${McpRuntimeName}-*"
+              - Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*:log-stream:*"
+              - Effect: Allow
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords, xray:GetSamplingRules, xray:GetSamplingTargets]
+                Resource: "*"
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals: { cloudwatch:namespace: bedrock-agentcore }
+              - Sid: WorkloadIdentity
+                Effect: Allow
+                Action: [bedrock-agentcore:GetWorkloadAccessToken, bedrock-agentcore:GetWorkloadAccessTokenForJWT]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default"
+                  - !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/${AgentRuntimeName}-*"
+                  - !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/${McpRuntimeName}-*"
+              - Sid: BedrockModelInvocation
+                Effect: Allow
+                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*"
+              - Sid: ApplyGuardrail
+                Effect: Allow
+                Action: bedrock:ApplyGuardrail
+                Resource: !GetAtt Guardrail.GuardrailArn
+              - Sid: AgentCallsMcpRuntime
+                Effect: Allow
+                Action: bedrock-agentcore:InvokeAgentRuntime
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/${McpRuntimeName}-*"
+
+  # ------------------------------------------------------------------ notifications
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-alerts"
+      KmsMasterKeyId: alias/aws/sns
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+Outputs:
+  AgentRepositoryUri:
+    Value: !GetAtt AgentRepository.RepositoryUri
+    Export: { Name: !Sub "${ProjectName}-AgentRepositoryUri" }
+  McpRepositoryUri:
+    Value: !GetAtt McpRepository.RepositoryUri
+    Export: { Name: !Sub "${ProjectName}-McpRepositoryUri" }
+  AgentRepositoryArn:
+    Value: !GetAtt AgentRepository.Arn
+    Export: { Name: !Sub "${ProjectName}-AgentRepositoryArn" }
+  McpRepositoryArn:
+    Value: !GetAtt McpRepository.Arn
+    Export: { Name: !Sub "${ProjectName}-McpRepositoryArn" }
+  GuardrailId:
+    Value: !GetAtt Guardrail.GuardrailId
+    Export: { Name: !Sub "${ProjectName}-GuardrailId" }
+  GuardrailVersion:
+    Value: !GetAtt GuardrailVersion.Version
+    Export: { Name: !Sub "${ProjectName}-GuardrailVersion" }
+  RuntimeExecutionRoleArn:
+    Value: !GetAtt RuntimeExecutionRole.Arn
+    Export: { Name: !Sub "${ProjectName}-RuntimeExecutionRoleArn" }
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+    Export: { Name: !Sub "${ProjectName}-AlertTopicArn" }
+  AgentRuntimeName:
+    Value: !Ref AgentRuntimeName
+    Export: { Name: !Sub "${ProjectName}-AgentRuntimeName" }
+  McpRuntimeName:
+    Value: !Ref McpRuntimeName
+    Export: { Name: !Sub "${ProjectName}-McpRuntimeName" }

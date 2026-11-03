@@ -1,0 +1,42 @@
+# Local stack on Colima/Docker: same images that get pushed to ECR.
+#
+#   docker compose up --build -d
+#   python evals/run_eval.py --url http://127.0.0.1:9000/
+#
+# Ports are published to 127.0.0.1 only. The MCP server is not published at all:
+# the agent reaches it over the compose network, as it would through AgentCore.
+#
+# MODEL_PROVIDER=stub runs fully offline. To use real Bedrock + Guardrails locally,
+# set MODEL_PROVIDER=bedrock, GUARDRAIL_ID/VERSION, and mount AWS credentials
+# (see README "Local run against real Bedrock").
+services:
+  mcp-tools:
+    build: ./services/mcp_tools
+    platform: linux/arm64
+    environment:
+      MCP_ALLOWED_HOSTS: "mcp-tools:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8000), 2)"]
+      interval: 5s
+      retries: 10
+
+  agent:
+    build: ./services/agent
+    platform: linux/arm64
+    depends_on:
+      mcp-tools:
+        condition: service_healthy
+    environment:
+      MODEL_PROVIDER: ${MODEL_PROVIDER:-stub}
+      MODEL_ID: ${MODEL_ID:-us.anthropic.claude-haiku-4-5-20251001-v1:0}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      GUARDRAIL_ID: ${GUARDRAIL_ID:-}
+      GUARDRAIL_VERSION: ${GUARDRAIL_VERSION:-}
+      MCP_URL: http://mcp-tools:8000/mcp
+      PUBLIC_URL: http://127.0.0.1:9000/
+      # No collector locally: keep ADOT from trying to export.
+      OTEL_TRACES_EXPORTER: none
+      OTEL_METRICS_EXPORTER: none
+      OTEL_LOGS_EXPORTER: none
+    ports:
+      - "127.0.0.1:9000:9000"

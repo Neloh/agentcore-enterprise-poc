@@ -1,0 +1,304 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  AgentCore enterprise PoC - CI/CD: CodePipeline (V2) + CodeBuild (native ARM64).
+  Source -> Build&Test -> Staging (deploy + eval gate) -> Manual approval ->
+  Production (promote 'live' endpoints, bake on alarms, automatic rollback).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: agentcore-poc
+  ConnectionArn:
+    Type: String
+    Description: AWS CodeConnections ARN (GitHub / GitLab / Bitbucket), status AVAILABLE.
+  FullRepositoryId:
+    Type: String
+    Description: owner/repo containing this project at its root.
+  BranchName:
+    Type: String
+    Default: main
+  ModelId:
+    Type: String
+    Default: us.anthropic.claude-haiku-4-5-20251001-v1:0
+  EvalThreshold:
+    Type: String
+    Default: "1.0"
+  BakeMinutes:
+    Type: String
+    Default: "10"
+
+Resources:
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      VersioningConfiguration: { Status: Enabled }
+      LifecycleConfiguration:
+        Rules:
+          - { Id: expire, Status: Enabled, ExpirationInDays: 30, NoncurrentVersionExpiration: { NoncurrentDays: 7 } }
+
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: [!GetAtt ArtifactBucket.Arn, !Sub "${ArtifactBucket.Arn}/*"]
+            Condition: { Bool: { aws:SecureTransport: "false" } }
+
+  # ------------------------------------------------------------------ CodeBuild
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: build
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}-*"
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:GetObjectVersion, s3:GetBucketLocation]
+                Resource: [!GetAtt ArtifactBucket.Arn, !Sub "${ArtifactBucket.Arn}/*"]
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action: [ecr:BatchCheckLayerAvailability, ecr:InitiateLayerUpload, ecr:UploadLayerPart,
+                         ecr:CompleteLayerUpload, ecr:PutImage, ecr:BatchGetImage, ecr:DescribeImages]
+                Resource:
+                  - { "Fn::ImportValue": !Sub "${ProjectName}-AgentRepositoryArn" }
+                  - { "Fn::ImportValue": !Sub "${ProjectName}-McpRepositoryArn" }
+              - Sid: AgentCoreControlPlane
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:CreateAgentRuntime
+                  - bedrock-agentcore:UpdateAgentRuntime
+                  - bedrock-agentcore:GetAgentRuntime
+                  - bedrock-agentcore:ListAgentRuntimes
+                  - bedrock-agentcore:ListAgentRuntimeVersions
+                  - bedrock-agentcore:CreateAgentRuntimeEndpoint
+                  - bedrock-agentcore:UpdateAgentRuntimeEndpoint
+                  - bedrock-agentcore:GetAgentRuntimeEndpoint
+                  - bedrock-agentcore:ListAgentRuntimeEndpoints
+                  - bedrock-agentcore:CreateWorkloadIdentity
+                  - bedrock-agentcore:GetWorkloadIdentity
+                  - bedrock-agentcore:UpdateWorkloadIdentity
+                  - bedrock-agentcore:InvokeAgentRuntime
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/*"
+              - Sid: ListRuntimes
+                Effect: Allow
+                Action: bedrock-agentcore:ListAgentRuntimes
+                Resource: "*"
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: { "Fn::ImportValue": !Sub "${ProjectName}-RuntimeExecutionRoleArn" }
+                Condition:
+                  StringEquals: { iam:PassedToService: bedrock-agentcore.amazonaws.com }
+              - Effect: Allow
+                Action: [ssm:GetParameter, ssm:PutParameter]
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/agentcore-poc/*"
+              - Sid: MonitoringStack
+                Effect: Allow
+                Action: [cloudformation:CreateChangeSet, cloudformation:ExecuteChangeSet, cloudformation:DescribeChangeSet,
+                         cloudformation:DescribeStacks, cloudformation:DescribeStackEvents, cloudformation:GetTemplateSummary,
+                         cloudformation:CreateStack, cloudformation:UpdateStack]
+                Resource: !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ProjectName}-monitoring/*"
+              - Effect: Allow
+                Action: [cloudformation:DescribeStacks, cloudformation:ListExports]
+                Resource: "*"
+              - Effect: Allow
+                Action: [cloudwatch:PutMetricAlarm, cloudwatch:PutCompositeAlarm, cloudwatch:DeleteAlarms,
+                         cloudwatch:DescribeAlarms, cloudwatch:PutDashboard, cloudwatch:DeleteDashboards,
+                         cloudwatch:GetDashboard, cloudwatch:TagResource]
+                Resource: "*"
+
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${ProjectName}-build"
+      ServiceRole: !GetAtt BuildRole.Arn
+      Artifacts: { Type: CODEPIPELINE }
+      Source: { Type: CODEPIPELINE, BuildSpec: buildspecs/build.yml }
+      Environment:
+        Type: ARM_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux-aarch64-standard:3.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - { Name: PROJECT_NAME, Value: !Ref ProjectName }
+          - { Name: AGENT_REPO, Value: { "Fn::ImportValue": !Sub "${ProjectName}-AgentRepositoryUri" } }
+          - { Name: MCP_REPO, Value: { "Fn::ImportValue": !Sub "${ProjectName}-McpRepositoryUri" } }
+          - { Name: AGENT_RUNTIME, Value: { "Fn::ImportValue": !Sub "${ProjectName}-AgentRuntimeName" } }
+          - { Name: MCP_RUNTIME, Value: { "Fn::ImportValue": !Sub "${ProjectName}-McpRuntimeName" } }
+          - { Name: EXEC_ROLE_ARN, Value: { "Fn::ImportValue": !Sub "${ProjectName}-RuntimeExecutionRoleArn" } }
+          - { Name: GUARDRAIL_ID, Value: { "Fn::ImportValue": !Sub "${ProjectName}-GuardrailId" } }
+          - { Name: GUARDRAIL_VERSION, Value: { "Fn::ImportValue": !Sub "${ProjectName}-GuardrailVersion" } }
+          - { Name: ALERT_TOPIC_ARN, Value: { "Fn::ImportValue": !Sub "${ProjectName}-AlertTopicArn" } }
+          - { Name: MODEL_ID, Value: !Ref ModelId }
+          - { Name: EVAL_THRESHOLD, Value: !Ref EvalThreshold }
+          - { Name: BAKE_MINUTES, Value: !Ref BakeMinutes }
+      TimeoutInMinutes: 30
+
+  StagingProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${ProjectName}-staging"
+      ServiceRole: !GetAtt BuildRole.Arn
+      Artifacts: { Type: CODEPIPELINE }
+      Source: { Type: CODEPIPELINE, BuildSpec: buildspecs/staging.yml }
+      Environment:
+        Type: ARM_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux-aarch64-standard:3.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - { Name: PROJECT_NAME, Value: !Ref ProjectName }
+          - { Name: AGENT_REPO, Value: { "Fn::ImportValue": !Sub "${ProjectName}-AgentRepositoryUri" } }
+          - { Name: MCP_REPO, Value: { "Fn::ImportValue": !Sub "${ProjectName}-McpRepositoryUri" } }
+          - { Name: AGENT_RUNTIME, Value: { "Fn::ImportValue": !Sub "${ProjectName}-AgentRuntimeName" } }
+          - { Name: MCP_RUNTIME, Value: { "Fn::ImportValue": !Sub "${ProjectName}-McpRuntimeName" } }
+          - { Name: EXEC_ROLE_ARN, Value: { "Fn::ImportValue": !Sub "${ProjectName}-RuntimeExecutionRoleArn" } }
+          - { Name: GUARDRAIL_ID, Value: { "Fn::ImportValue": !Sub "${ProjectName}-GuardrailId" } }
+          - { Name: GUARDRAIL_VERSION, Value: { "Fn::ImportValue": !Sub "${ProjectName}-GuardrailVersion" } }
+          - { Name: ALERT_TOPIC_ARN, Value: { "Fn::ImportValue": !Sub "${ProjectName}-AlertTopicArn" } }
+          - { Name: MODEL_ID, Value: !Ref ModelId }
+          - { Name: EVAL_THRESHOLD, Value: !Ref EvalThreshold }
+          - { Name: BAKE_MINUTES, Value: !Ref BakeMinutes }
+      TimeoutInMinutes: 45
+
+  ProductionProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${ProjectName}-production"
+      ServiceRole: !GetAtt BuildRole.Arn
+      Artifacts: { Type: CODEPIPELINE }
+      Source: { Type: CODEPIPELINE, BuildSpec: buildspecs/production.yml }
+      Environment:
+        Type: ARM_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux-aarch64-standard:3.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - { Name: PROJECT_NAME, Value: !Ref ProjectName }
+          - { Name: AGENT_REPO, Value: { "Fn::ImportValue": !Sub "${ProjectName}-AgentRepositoryUri" } }
+          - { Name: MCP_REPO, Value: { "Fn::ImportValue": !Sub "${ProjectName}-McpRepositoryUri" } }
+          - { Name: AGENT_RUNTIME, Value: { "Fn::ImportValue": !Sub "${ProjectName}-AgentRuntimeName" } }
+          - { Name: MCP_RUNTIME, Value: { "Fn::ImportValue": !Sub "${ProjectName}-McpRuntimeName" } }
+          - { Name: EXEC_ROLE_ARN, Value: { "Fn::ImportValue": !Sub "${ProjectName}-RuntimeExecutionRoleArn" } }
+          - { Name: GUARDRAIL_ID, Value: { "Fn::ImportValue": !Sub "${ProjectName}-GuardrailId" } }
+          - { Name: GUARDRAIL_VERSION, Value: { "Fn::ImportValue": !Sub "${ProjectName}-GuardrailVersion" } }
+          - { Name: ALERT_TOPIC_ARN, Value: { "Fn::ImportValue": !Sub "${ProjectName}-AlertTopicArn" } }
+          - { Name: MODEL_ID, Value: !Ref ModelId }
+          - { Name: EVAL_THRESHOLD, Value: !Ref EvalThreshold }
+          - { Name: BAKE_MINUTES, Value: !Ref BakeMinutes }
+      TimeoutInMinutes: 60
+
+  # ------------------------------------------------------------------ CodePipeline
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codepipeline.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: pipeline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:GetObjectVersion, s3:GetBucketVersioning, s3:GetBucketLocation]
+                Resource: [!GetAtt ArtifactBucket.Arn, !Sub "${ArtifactBucket.Arn}/*"]
+              - Effect: Allow
+                Action: [codebuild:StartBuild, codebuild:BatchGetBuilds]
+                Resource: [!GetAtt BuildProject.Arn, !GetAtt StagingProject.Arn, !GetAtt ProductionProject.Arn]
+              - Effect: Allow
+                Action: [codeconnections:UseConnection, codestar-connections:UseConnection]
+                Resource: !Ref ConnectionArn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: { "Fn::ImportValue": !Sub "${ProjectName}-AlertTopicArn" }
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "${ProjectName}-release"
+      PipelineType: V2
+      ExecutionMode: SUPERSEDED
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore: { Type: S3, Location: !Ref ArtifactBucket }
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId: { Category: Source, Owner: AWS, Provider: CodeStarSourceConnection, Version: "1" }
+              Configuration:
+                ConnectionArn: !Ref ConnectionArn
+                FullRepositoryId: !Ref FullRepositoryId
+                BranchName: !Ref BranchName
+                OutputArtifactFormat: CODE_ZIP
+              OutputArtifacts: [{ Name: Src }]
+        - Name: BuildAndTest
+          Actions:
+            - Name: UnitTestLintBuildPush
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration: { ProjectName: !Ref BuildProject }
+              InputArtifacts: [{ Name: Src }]
+              OutputArtifacts: [{ Name: Images }]
+        - Name: Staging
+          Actions:
+            - Name: DeployStagingAndEvalGate
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration:
+                ProjectName: !Ref StagingProject
+                PrimarySource: Src
+              InputArtifacts: [{ Name: Src }, { Name: Images }]
+              OutputArtifacts: [{ Name: Release }]
+        - Name: Approval
+          Actions:
+            - Name: ApproveProduction
+              ActionTypeId: { Category: Approval, Owner: AWS, Provider: Manual, Version: "1" }
+              Configuration:
+                NotificationArn: { "Fn::ImportValue": !Sub "${ProjectName}-AlertTopicArn" }
+                CustomData: Staging eval gate passed. Review eval-report.json in the Release artifact, then approve promotion to 'live'.
+        - Name: Production
+          Actions:
+            - Name: PromoteBakeAutoRollback
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration:
+                ProjectName: !Ref ProductionProject
+                PrimarySource: Src
+              InputArtifacts: [{ Name: Src }, { Name: Release }]
+
+Outputs:
+  PipelineName:
+    Value: !Ref Pipeline
+  PipelineUrl:
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${Pipeline}/view"

@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+eval-report.json
+it-report.json
+live-smoke.json
+*.out.json
+mcp.json
+agent.json
+.DS_Store
